@@ -74,9 +74,23 @@ Kafka 分区中的所有副本统称为 AR（Assigned Repllicas）。  AR = ISR 
 
 
 
+## Kafka 选举
 
+Kafka的选举分为三种，分别是Controller 选举，Partition 选举以及Consumer leader 选举
 
+### Controller 选举
 
+在启动 Kafka 系统时候, 其中一个 Broker 会被选举为控制器, 负责管理主题分区和副本的状态, 还会执行重分配的任务。
+
+1) 第一个启动的节点，会在 Zookeeper 系统里面创建一个临时节点 /controller ，并写入该节点的注册信息，使该节点成为控制器。
+
+2) 其他的节点在陆续启动时，也会尝试在 Zookeeper 系统中创建 /controller 节点，但是 /controller 节点已经存在，所以会抛出 “创建/controller节点失败异常” 的信息。创建失败的节点会根据返回的结果，判断出在 Kafka 集群中已经有一个控制器被成功创建了，所以放弃创建 /controller 节点，这样就确保了 Kafka 集群控制器的唯一性。
+
+3) 其他的节点，也会在控制器上注册相应的监听器，各个监听器负责监听各自代理节点的状态变化。当监听到节点状态发生变化时，会触发相应的监听函数进行处理。
+
+各个节点公平竞争抢占 Zookeeper 系统中创建 /controller临时节点，最先创建成功的节点会成为控制器，并拥有选举主题分区Leader节点的功能
+
+ Kafka 使用 Zookeeper 来维护集群 Brokers 的信息，每个 Broker 都有一个唯一的标识**`broker.id`**，用于标识自己在集群中的身份。Brokers 会通过 Zookeeper 选举出一个叫**`Controller Broker`**节点，它除了具备其它Brokers的功能外，还**负责管理主题分区及其副本的状态**。
 
 
 
@@ -99,6 +113,22 @@ Kafka的发送流程如下：
 - [client.id](https://link.segmentfault.com/?enc=rhjNFkGmUug2hwx0WBRbYQ%3D%3D.UpNfbww5Q%2F2I22vu9MQNzlUWrlF2zAno%2FWs2EhMww5Y%3D)**：**该参数可以是任意字符串，服务器会用它来识别消息的来源，还可用用在日志和配额指标里。
 - [max.in](https://link.segmentfault.com/?enc=uXQWuSzzxFwWtMsB52V8Xw%3D%3D.HVTyhc3CQiCD4GVVpW7idQ%3D%3D)**.flight.requests.per.connection：**该参数指定了生产者在收到服务器响应之前可以发送多少个消息。它的值越高，就会占用越多的内存，不过也会提升吞吐量。**把它设置为1可以保证消息时按发送的顺序写入服务器的，即使发生了重试。**
 
+![图片](https://mmbiz.qpic.cn/mmbiz_png/FrBePKkiazppn1MKTI37kEBia3ib6zYGoXELelWbxrHBHwX4z3mcX9UyT9yWN9U0SEnOG5H9BxhYtU7qbdMjjqqhQ/640?wx_fmt=png&wxfrom=5&wx_lazy=1&wx_co=1)
+
+1) 首先来一条消息后,生产者源码里面会对消息进行封装成 ProducerRecord对象。 
+
+2) 封装成对象后会对该对象进行序列化[涉及网络传输], 调用Serializer组件进行序列化, 序列化后进行发送。
+
+3) 在发送前要确定一件事, 到底要把这条消息发送到哪个主题的哪个分区, 这个时候就需要通过 Partitioner 分区器 从 Kafka Broker集群中获取集群元数据,  获取到元数据后就可以进行发送了。
+
+4) 在0.8版本之前, 这个时候来了一条消息就会封装成一个请求发送到Broker, 这种情况下, 性能是非常差的, 在0.8版本之后, 进行简单的改进, 性能得到了指数级上升, 即来了一条消息后不会立马发送出去, 而是先写入到一个缓存(RecordAccumulator)队列中,封装成一个个批次(RecordBatch)。
+
+5) 这个时候会有一个sender线程会将多个批次封装成一个请求(Request), 然后进行发送, 这样会减少很多请求,提高吞吐量。**这个时候有个问题, 一条消息过来后没有立即发送出去,而是封装成了批次, 这样会不会有延迟的问题, 默认的batch.size是16K, 写满会立即发送, 如果写不满, 也会在规定的时间进行发送(linger.ms = 500ms)**
+
+6) 发送的时候 每个Request请求对应多路复用器(Selector)中的每个kafka channel 然后将数据发送给Broker集群
+
+7) 在封装Batch批次和Request请求的过程中, 还涉及一个重要的设计理念即内存池方案, 在后面的服务端内存池部分进行详细说明
+
 
 
 ### 默认分区策略
@@ -114,6 +144,373 @@ Kafka的发送流程如下：
 -  **-1（all）：**producer等待broker的ack，partition的leader和ISR里的follower全部落盘成功后才返回ack。但是如果在follower同步完成后，broker发送ack之前，leader发生故障，那么会造成重复数据。（极端情况下也有可能丢数据：ISR中只有一个Leader时，相当于1的情况）
 
 ![image-20221004213839841](assets/image-20221004213839841.png)
+
+
+
+### 内存池
+
+Kafka client 由于在发送消息时为了增加性能减少网络传输的次数，会在客户端缓存需要发送的消息，为了避免频繁的创建内存，减少gc的次数，Kafka提出了内存池的概念，既在发行消息时，kafka会首先从内存池中查找是否有已经创建好的内存块，如果没有则会开辟一块新的内存放入到内存池中
+
+![图片](https://mmbiz.qpic.cn/mmbiz_png/FrBePKkiazppn1MKTI37kEBia3ib6zYGoXEmG0clQsW211cHS33aFMHBC2eNw1YRFwiaf8NugZamu6JhsT1StyVEBw/640?wx_fmt=png&wxfrom=5&wx_lazy=1&wx_co=1)
+
+1) 这里简化下流程, 来一条消息会先进行封装然后序列化最后会计算出分区号, 并把这个消息存储到缓存里面
+
+2) 这个缓存里面也是有设计的 即批次队列, 那么这个批次队列是使用什么策略存储呢? **一个分区对应一个队列, 这里有个重要的数据结构:Batches, 这个数据结构是Key-value形式, key是消息主题的分区, value是一个队列, 里面存储的发送到对应分区的批次**
+
+3) 那么假设这个时候 我们有个2个topic, 每个topic有2个分区, 那么是不是总共有4个的分区即4个队列, 每个队列里面都有一个个批次, 这个时候消息算出来分区后就会写入队列的最新一个批次
+
+4) Sender线程就会检测这个批次(Batch)是否已经写满,或者时间是否到达, 如果满足Sender线程就会取出封装成Request就会发送
+
+5) 封装批次会用到内存, Sender发送完毕内存会进行回收, 在Java中如果频繁操作内存和回收,会遇到头疼的FullGC的问题, 工作线程的性能就会降低, 整个生产者的性能就会受到影响, **Kafka的解决方案就是内存池, 对内存块的使用跟数据库的连接池一样**
+
+6) 整个Buffer Poll 内存池大小是**32M** , 内存池分为两个部分, 一个部分是内存队列, 队列里面有一个个**内存块(16K)**, 另外一部分是可用内存,  一条消息过来后会向内存池申请内存块, 申请完后封装批次并写入数据, sender线程就会发送并响应, 然后清空内存放回内存池里面进行反复使用, 这样就大大减少了GC的频率, 保证了生产者的稳定和高效, 性能会大大提高 
+
+
+
+```java
+
+public class BufferPool {
+
+    static final String WAIT_TIME_SENSOR_NAME = "bufferpool-wait-time";
+
+    /**
+     * 全部内存大小
+     */
+    private final long totalMemory;
+
+    /**
+     * 每一块内存的大小
+     */
+    private final int poolableSize;
+
+    /**
+     *
+     */
+    private final ReentrantLock lock;
+
+    /**
+     * 用于存储空闲的ByteBuffer内存
+     */
+    private final Deque<ByteBuffer> free;
+    
+    // 用于添加当内存池内存不足时等待的线程，这里使用Deque保存的话，可以避免线程饥饿问题
+    private final Deque<Condition> waiters;
+    /** Total available memory is the sum of nonPooledAvailableMemory and the number of byte buffers in free * poolableSize.  */
+    /**
+     * 未开辟的可用内存，当free列表中没有可用内存时，就可以判断 nonPooledAvailableMemory 是否 > size，如果大于则通过allocateByteBuffer进行开启
+     * ，总可用内存 =  nonPooledAvailableMemory + free * poolableSize
+     */
+    private long nonPooledAvailableMemory;
+    private boolean closed;
+
+    /**
+     * Create a new buffer pool
+     *
+     * @param memory The maximum amount of memory that this buffer pool can allocate, 表示当前内存池最大有多少内存可以使用
+     * @param poolableSize The buffer size to cache in the free list rather than deallocating
+     */
+    public BufferPool(long memory, int poolableSize) {
+        this.poolableSize = poolableSize;
+        this.lock = new ReentrantLock();
+        this.free = new ArrayDeque<>();
+        this.waiters = new ArrayDeque<>();
+        this.totalMemory = memory;
+        this.nonPooledAvailableMemory = memory;
+        this.closed = false;
+    }
+
+    
+    //创建一个新的内存，如果没有足够的内存会一直阻塞，直接达到maxTimeToBlockMs
+    public ByteBuffer allocate(int size, long maxTimeToBlockMs) throws InterruptedException {
+        if (size > this.totalMemory)
+            throw new IllegalArgumentException("Attempt to allocate " + size
+                                               + " bytes, but there is a hard limit of "
+                                               + this.totalMemory
+                                               + " on memory allocations.");
+
+        ByteBuffer buffer = null;
+        this.lock.lock();
+
+        if (this.closed) {
+            this.lock.unlock();
+            throw new BusinessException("Producer closed while allocating memory");
+        }
+
+        try {
+            // check if we have a free buffer of the right size pooled
+            //如果请求的内存大小 = 内存块大小，并且free列表不为空则poll出第一个内存
+            // 如果空闲队列中没有足够的内存进行分配，则通过nonPooledAvailableMemory来进行分配
+            if (size == poolableSize && !this.free.isEmpty())
+                return this.free.pollFirst();
+
+            // now check if the request is immediately satisfiable with the
+            // memory on hand or if we need to block
+            //获取空闲队列的可用内存大小
+            int freeListSize = freeSize() * this.poolableSize;
+
+            //如果未开启的内存 + 空闲队列内存大小足够对当前的申请内存进行开启，则直接开辟
+            if (this.nonPooledAvailableMemory + freeListSize >= size) {
+                // we have enough unallocated or pooled memory to immediately
+                // satisfy the request, but need to allocate the buffer
+                //循环取出free队列中的内存块并入nonPooledAvailableMemory
+                freeUp(size);
+                //未开辟的可用内存为 nonPooledAvailableMemory - size
+                this.nonPooledAvailableMemory -= size;
+            }
+
+
+            else {
+                // we are out of memory and will have to block
+                //从当前内存池中拿到的内存
+                int accumulated = 0;
+
+                //创建一个新的条件队列
+                Condition moreMemory = this.lock.newCondition();
+                try {
+
+                    //获取内存的最大阻塞时间
+                    long remainingTimeToBlockNs = TimeUnit.MILLISECONDS.toNanos(maxTimeToBlockMs);
+                    this.waiters.addLast(moreMemory);
+                    // loop over and over until we have a buffer or have reserved
+                    // enough memory to allocate one
+                    //循环等待从当前内存池到获取内存，直到获取到的内存可以足够满足当前的申请size
+                    while (accumulated < size) {
+                        long startWaitNs = System.nanoTime();
+                        long timeNs;
+                        boolean waitingTimeElapsed;
+                        try {
+                            waitingTimeElapsed = !moreMemory.await(remainingTimeToBlockNs, TimeUnit.NANOSECONDS);
+                        } finally {
+                            long endWaitNs = System.nanoTime();
+                            timeNs = Math.max(0L, endWaitNs - startWaitNs);
+                        }
+
+                        if (this.closed)
+                            throw new BusinessException("Producer closed while allocating memory");
+
+                        if (waitingTimeElapsed) {
+                            throw new BusinessException("Failed to allocate " + size + " bytes within the configured max blocking time "
+                                + maxTimeToBlockMs + " ms. Total memory: " + totalMemory() + " bytes. Available memory: " + availableMemory()
+                                + " bytes. Poolable size: " + poolableSize() + " bytes");
+                        }
+
+                        remainingTimeToBlockNs -= timeNs;
+
+                        // check if we can satisfy this request from the free list,
+                        // otherwise allocate memory
+                        //如果申请的内存块大小正好等于poolableSize，并且空闲队列也不为空，则直接从队列中虎丘
+                        if (accumulated == 0 && size == this.poolableSize && !this.free.isEmpty()) {
+                            // just grab a buffer from the free list
+                            buffer = this.free.pollFirst();
+                            accumulated = size;
+                        } else {
+                            // we'll need to allocate memory, but we may only get
+                            // part of what we need on this iteration
+
+                            //将free队列中buffer循环并入到nonPooledAvailableMemory，直到满足当前内存块的申请
+                            freeUp(size - accumulated);
+
+                            //判断nonPooledAvailableMemory是否已经满足当前牛才能块申请了
+                            int got = (int) Math.min(size - accumulated, this.nonPooledAvailableMemory);
+
+                            //当前未开辟内存 = nonPooledAvailableMemory - got(即将被分出去的内存)
+                            this.nonPooledAvailableMemory -= got;
+
+                            //将accumulated进行累加，到下一次循环时判断是否当前分配的内存是否已经可以满足当前内存块的申请
+                            accumulated += got;
+                        }
+                    }
+                    
+                    //这里将accumulated主要是为了避免在获取内存超时或者是其他异常情况下需要将现有获取到的内存归还到内存池中
+                    // Don't reclaim memory on throwable since nothing was thrown
+                    accumulated = 0;
+                } finally {
+                    
+                    //这里分为两种情况，分别是正常获取成功时，以及获取失败时
+                    //成功时：this.nonPooledAvailableMemory + 0
+                    //失败时：this.nonPooledAvailableMemory + 已经获取到的内存 
+                    // When this loop was not able to successfully terminate don't loose available memory
+                    this.nonPooledAvailableMemory += accumulated;
+                    this.waiters.remove(moreMemory);
+                }
+            }
+        } finally {
+            // signal any additional waiters if there is more memory left
+            // over for them
+            try {
+                if (!(this.nonPooledAvailableMemory == 0 && this.free.isEmpty()) && !this.waiters.isEmpty())
+                    this.waiters.peekFirst().signal();
+            } finally {
+                // Another finally... otherwise find bugs complains
+                lock.unlock();
+            }
+        }
+
+        //这里buffer == null 表示free队列为空，表示需要从nonPooledAvailableMemory来进行开辟
+        if (buffer == null)
+            //开辟一块新的内存进行返回
+            return safeAllocateByteBuffer(size);
+        else
+            return buffer;
+    }
+
+
+    /**
+     * Allocate a buffer.  If buffer allocation fails (e.g. because of OOM) then return the size count back to
+     * available memory and signal the next waiter if it exists.
+     */
+    //分配缓冲区。如果缓冲区分配失败(例如因为 OOM) ，那么将大小计数返回到可用内存，并向下一个侍者发出信号(如果存在)。
+    private ByteBuffer safeAllocateByteBuffer(int size) {
+        boolean error = true;
+        try {
+            ByteBuffer buffer = allocateByteBuffer(size);
+            error = false;
+            return buffer;
+        } finally {
+            if (error) {
+                this.lock.lock();
+                try {
+                    this.nonPooledAvailableMemory += size;
+                    if (!this.waiters.isEmpty())
+                        this.waiters.peekFirst().signal();
+                } finally {
+                    this.lock.unlock();
+                }
+            }
+        }
+    }
+
+    // Protected for testing.
+    protected ByteBuffer allocateByteBuffer(int size) {
+        return ByteBuffer.allocate(size);
+    }
+
+    /**
+     * Attempt to ensure we have at least the requested number of bytes of memory for allocation by deallocating pooled
+     * buffers (if needed)
+     */
+    //如果未开启内存nonPooledAvailableMemory < 当前申请的内存大小
+    // 则从free队列的队尾的循环取出buffer直到可以满足当前申请内存的大小
+    private void freeUp(int size) {
+        while (!this.free.isEmpty() && this.nonPooledAvailableMemory < size)
+            this.nonPooledAvailableMemory += this.free.pollLast().capacity();
+    }
+
+    /**
+     * Return buffers to the pool. If they are of the poolable size add them to the free list, otherwise just mark the
+     * memory as free.
+     *
+     * @param buffer The buffer to return
+     * @param size The size of the buffer to mark as deallocated, note that this may be smaller than buffer.capacity
+     *             since the buffer may re-allocate itself during in-place compression
+     */
+    //如果buffer的大小等于 poolableSize,则将该buffer放入到free队列中，否则将nonPooledAvailableMemory + size
+    //
+    public void deallocate(ByteBuffer buffer, int size) {
+        lock.lock();
+        try {
+            //如果bufferSize == poolableSize 则直接放回队列
+            if (size == this.poolableSize && size == buffer.capacity()) {
+                buffer.clear();
+                this.free.add(buffer);
+            } else {
+
+                //否则不对buffer处理，并且将 nonPooledAvailableMemory + size
+                this.nonPooledAvailableMemory += size;
+            }
+
+            //从等待队列中拿到第一个等待获取内存块的condition，然后释放，这样的作用在于避免现线程饥饿
+            Condition moreMem = this.waiters.peekFirst();
+            if (moreMem != null)
+                moreMem.signal();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public void deallocate(ByteBuffer buffer) {
+        if (buffer != null)
+            deallocate(buffer, buffer.capacity());
+    }
+
+    /**
+     * the total free memory both unallocated and in the free list
+     */
+    public long availableMemory() {
+        lock.lock();
+        try {
+            return this.nonPooledAvailableMemory + freeSize() * (long) this.poolableSize;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // Protected for testing.
+    protected int freeSize() {
+        return this.free.size();
+    }
+
+    /**
+     * Get the unallocated memory (not in the free list or in use)
+     */
+    public long unallocatedMemory() {
+        lock.lock();
+        try {
+            return this.nonPooledAvailableMemory;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * The number of threads blocked waiting on memory
+     */
+    public int queued() {
+        lock.lock();
+        try {
+            return this.waiters.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * The buffer size that will be retained in the free list after use
+     */
+    public int poolableSize() {
+        return this.poolableSize;
+    }
+
+    /**
+     * The total memory managed by this pool
+     */
+    public long totalMemory() {
+        return this.totalMemory;
+    }
+
+    // package-private method used only for testing
+    Deque<Condition> waiters() {
+        return this.waiters;
+    }
+
+    /**
+     * Closes the buffer pool. Memory will be prevented from being allocated, but may be deallocated. All allocations
+     * awaiting available memory will be notified to abort.
+     */
+    public void close() {
+        this.lock.lock();
+        this.closed = true;
+        try {
+            for (Condition waiter : this.waiters)
+                waiter.signal();
+        } finally {
+            this.lock.unlock();
+        }
+    }
+}
+```
+
+
 
 
 
@@ -386,9 +783,47 @@ topic是逻辑上的概念，而partition是物理上的概念，每个partition
 
 index和log文件以当前segment的第一条消息的offset命名。
 
+![图片](assets/640.png)
+
+
+
+1. kafka 中消息是以主题 Topic 为基本单位进行归类的，这里的 Topic 是逻辑上的概念，实际上在磁盘存储是根据分区 Partition 存储的, 即每个 Topic 被分成多个 Partition，分区 Partition 的数量可以在主题 Topic 创建的时候进行指定。
+2. Partition 分区主要是为了解决 Kafka 存储的水平扩展问题而设计的， 如果一个 Topic 的所有消息都只存储到一个 Kafka Broker上的话， 对于 Kafka 每秒写入几百万消息的高并发系统来说，这个 Broker 肯定会出现瓶颈， 故障时候不好进行恢复，所以 Kafka 将 Topic 的消息划分成多个 Partition， 然后均衡的分布到整个 Kafka Broker 集群中。
+3. Partition 分区内每条消息都会被分配一个唯一的消息 id,即我们通常所说的 偏移量 Offset,  因此 kafka 只能保证每个分区内部有序性,并不能保证全局有序性。
+4. 然后每个 Partition 分区又被划分成了多个 LogSegment，这是为了防止 Log 日志过大，Kafka 又引入了日志分段(LogSegment)的概念，将 Log 切分为多个 LogSegement，相当于一个巨型文件被平均分割为一些相对较小的文件，这样也便于消息的查找、维护和清理。这样在做历史数据清理的时候，直接删除旧的 LogSegement 文件就可以了。
+5. Log 日志在物理上只是以文件夹的形式存储，而每个 LogSegement 对应磁盘上的一个日志文件和两个索引文件，以及可能的其他文件(比如以".snapshot"为后缀的快照索引文件等)
+
 
 
 ### 定位数据
+
+我们通过上面可以发现Kafka添加数据都是以顺信写的方式添加到LogSegment文件中，并且在添加Message消息时，也会添加相应的索引，用于通过offset来定位Segment文件中的数据，在这里要注意以下几点：
+
+- Kafka在写入LogSegment文件时是以顺序写的方式进行添加的
+- Kafka采用了稀疏索引的方式，LogSement 文件每写入4K数据，就会添加一条索引，不过这个索引数据是以offset为维度添加的
+- Kafka的LogSegement 文件名称与LogIndex文件名称是相对应的，都是以当前文件中最小的offset来命名的，每当创建一个新的LogSegment文件时就会创建一个LogIndex文件
+- 一个Partition对应Segment文件，并且Segment文件大小默认为1G，底层是通过mmap的方式来进行数据写入的
+- 在通过offset查找数据时，首先会对segment文件名称或者是index文件名称进行二分查找，通过offset可以定位到具体的Segment文件以及index文件，然后对index文件内部的数据进行二分查找，不过不同于标准的二分查找，由于index文件是以稀疏索引的方式存储的，所以在二分查找时如果查不到对应的数据，会根据查找的类型来返回小于target offset的 offset slot 还是 大于 target offset 的 entry slot
+
+
+
+![image-20230301210750273](assets/image-20230301210750273.png)
+
+
+
+Log 中写入消息是顺序写入的。**但是只有最后一个 LogSegement 才能执行写入操作**，之前的所有 LogSegement 都不能执行写入操作。为了更好理解这个概念，我们将最后一个 LogSegement 称为**"activeSegement"，即表示当前活跃的日志分段**。随着消息的不断写入，当 activeSegement 满足一定的条件时，就需要创建新的 activeSegement，之后再追加的消息会写入新的 activeSegement。
+
+![image-20230301221512402](assets/image-20230301221512402.png)
+
+为了更高效的进行消息检索，每个 LogSegment 中的日志文件（以“.log”为文件后缀）都有对应的几个索引文件：**偏移量索引文件（以“.index”为文件后缀）、时间戳索引文件（以“.timeindex”为文件后缀）、快照索引文件 （以“.snapshot”为文件后缀）**。其中每个 LogSegment 都有一个 Offset 来作为基准偏移量（baseOffset），用来表示当前 LogSegment 中第一条消息的 Offset。偏移量是一个64位的 Long 长整型数，日志文件和这几个索引文件都是根据基准偏移量（baseOffset）命名的，名称固定为20位数字，没有达到的位数前面用0填充。比如第一个 LogSegment 的基准偏移量为0，对应的日志文件为00000000000000000000.log
+
+
+
+
+
+![image-20230301210332662](assets/image-20230301210332662.png)
+
+
 
 查找message的流程（比如要查找offset为170417的message）：
 
@@ -404,46 +839,117 @@ index和log文件以当前segment的第一条消息的offset命名。
 
 
 
-### 日志清理策略
+### 日志清除
 
-当日志片段大小达到log.segment.bytes指定的上限（默认是1GB）或者日志片段打开时长达到l[og.segment.ms](https://link.segmentfault.com/?enc=UsAhxMa3RSzVZ58DfA5Kaw%3D%3D.HlGYKzZi%2BRAZFDAQxHxOCGhzuA2MLCvArhRtLOHMjCs%3D)时，当前日志片段就会被关闭，一个新的日志片段被打开。如果一个日志片段被关闭，就开始等待过期。**当前正在写入的片段叫做活跃片段，活跃片段永远不会被删除，**所以如果你要保留数据1天，但是片段包含5天的数据，那么这些数据就会被保留5天，因为片段被关闭之前，这些数据无法被删除。
+Kafka 将消息存储到磁盘中，随着写入数据不断增加，磁盘占用空间越来越大，为了控制占用空间就需要对消息做一定的清理操作。从上面 Kafka 存储日志结构分析中每一个分区副本（Replica）都对应一个 Log，而 Log 又可以分为多个日志分段（LogSegment），这样就便于 Kafka 对日志的清理操作。
 
-Kafka 中默认的日志保存时间为 7 天，可以通过调整如下参数修改保存时间
+​    Kafka提供了两种日志清理策略：
 
-- log.retention.hours，最低优先级小时，默认 7 天。 
-- log.retention.minutes，分钟。 
--  log.retention.ms，最高优先级毫秒。 
--  log.retention.check.interval.ms，负责设置检查周期，默认 5 分钟。
+> 1、日志删除（Log Retention）：按照一定的保留策略直接删除不符合条件的日志分段（LogSegment）。
+>
+> 2、 日志压缩（Log Compaction）：针对每个消息的key进行整合，对于有相同key的不同value值，只保留最后一个版本。
 
-那么日志一旦超过了设置的时间，就会根据相应的日志清理策略来进行清理，默认分为两种：delete 和 compact
+​    这里我们可以通过 Kafka Broker 端参数 **log.cleanup.policy** 来设置日志清理策略，**默认值为 “delete”，即采用日志删除的清理策略**。如果要采用**日志压缩的清理策略**，就需要将 log.cleanup.policy 设置为 **“compact”**，这样还不够，必须还要将**log.cleaner.****enable（默认值为 true）设为 true**。
+
+如果想要同时支持两种清理策略， 可以直接将 log.cleanup.policy 参数设置为“delete，compact”。
+
+​        
+
+####  日志删除
+
+Kafka 的日志管理器（LogManager）中有一个专门的日志清理任务通过周期性检测和删除不符合条件的日志分段文件（LogSegment），这里我们可以通过 Kafka Broker 端的参数 **log.retention.check.****interval.ms** 来配置，默认值为300000，即5分钟。
+
+ 在 Kafka 中一共有3种保留策略：
+
+**基于时间的策略**
+
+日志删除任务会周期检查当前日志文件中是否有保留时间超过设定的阈值**(retentionMs)** 来寻找可删除的日志段文件集合**(****deletableSegments)**。
+
+其中**retentionMs**可以通过 Kafka Broker 端的这几个参数的大小判断的
+
+log.retention.ms > log.retention.minutes > log.retention.hours优先级来设置，**默认情况只会配置 log.retention.hours 参数，值为168即为7天。**
+
+这里需要注意：删除过期的日志段文件，并不是简单的根据该日志段文件的修改时间计算的，而是要根据该日志段中最大的时间戳 largestTimeStamp 来计算的，首先要查询该日志分段所对应的时间戳索引文件，查找该时间戳索引文件的最后一条索引数据，如果时间戳值大于0，则取值，否则才会使用最近修改时间（lastModifiedTime）。
+
+ **【删除步骤】：**
+
+ 1、 首先从 Log 对象所维护的日志段的跳跃表中移除要删除的日志段，用来确保已经没有线程来读取这些日志段。   
+
+ 2、将日志段所对应的所有文件，包括索引文件都添加上“.deleted”的后缀
+
+ 3、最后交给一个以“delete-file”命名的延迟任务来删除这些以“ .deleted ”为后缀的文件。默认1分钟执行一次， 可以通过 file.delete.delay.ms 来配置。
+
+![image-20230301222136986](assets/image-20230301222136986.png)
 
 
 
-#### delete 清理
+**基于日志大小的策略**
 
-delete 日志删除：将过期数据删除
+日志删除任务会周期检查当前日志大小是否超过设定的阈值**(retentionSize)** 来寻找可删除的日志段文件集合**(deletableSegments)**
 
-- log.cleanup.policy = delete 所有数据启用删除策略 
+其中 retentionSize 这里我们可以通过 Kafka Broker 端的参数log.retention.bytes来设置， 默认值为-1，即无穷大。
 
-（1）基于时间：默认打开。以 segment 中所有记录中的最大时间戳作为该文件时间戳。 
+这里需要注意的是 log.retention.bytes 设置的是Log中所有日志文件的大小，而不是单个日志段的大小。单个日志段可以通过参数 log.segment.bytes 来设置，默认大小为1G
 
-（2）基于大小：默认关闭。超过设置的所有日志总大小，删除最早的 segment，log.retention.bytes，默认等于-1，表示无穷大
+***删除策略***
+
+1、首先计算日志文件的总大小Size和retentionSize的差值，即需要删除的日志总大小。
+
+2、然后从日志文件中的第一个日志段开始进行查找可删除的日志段的文件集合(deletableSegments)
+
+3、找到后就可以进行删除操作了。
+
+![image-20230301222258600](assets/image-20230301222258600.png)
 
 
 
+**基于日志的起始偏移量**
+
+该策略判断依据是日志段的下一个日志段的起始偏移量 baseOffset 是否小于等于 logStartOffset，如果是，则可以删除此日志分段。
+
+***【如下图所示 删除步骤】：***
+
+1、首先从头开始遍历每个日志段，日志段 1 的下一个日志分段的起始偏移量为20，小于logStartOffset的大小，将日志段1加入deletableSegments。
+
+2、日志段2的下一个日志偏移量的起始偏移量为35，也小于logStartOffset的大小，将日志分段2页加入deletableSegments。
+
+3、日志段3的下一个日志偏移量的起始偏移量为50，也小于logStartOffset的大小，将日志分段3页加入deletableSegments。
+
+4、日志段4的下一个日志偏移量通过对比后，在logStartOffset的右侧，那么从日志段4开始的所有日志段都不会加入deletableSegments
+
+5、待收集完所有的可删除的日志集合后就可以直接删除了
+
+![image-20230301222444479](assets/image-20230301222444479.png)
 
 
-#### compat 清理
 
-compact日志压缩：对于相同key的不同value值，只保留最后一个版本。
+#### 日志压缩
 
-- log.cleanup.policy = compact 所有数据启用压缩策略
+**日志压缩 Log Compaction 对于有相同key的不同value值，只保留最后一个版本。**如果应用只关心 key 对应的最新 value 值，则可以开启 Kafka 相应的日志清理功能，Kafka会定期将相同 key 的消息进行合并，只保留最新的 value 值。
 
-![image-20221004211305145](assets/image-20221004211305145.png)
+​    Log Compaction 可以类比 Redis 中的 RDB 的持久化模式。我们可以想象下，如果每次消息变更都存 Kafka，在某一时刻， Kafka 异常崩溃后，如果想快速恢复，可以直接使用日志压缩策略， 这样在恢复的时候只需要恢复最新的数据即可，这样可以加快恢复速度
 
-压缩后的offset可能是不连续的，比如上图中没有6，当从这些offset消费消息时，将会拿到比这个offset大 的offset对应的消息，实际上会拿到offset为7的消息，并从这个位置开始消费。
+![image-20230301222505353](assets/image-20230301222505353.png)
 
-这种策略只适合特殊场景，比如消息的key是用户ID，value是用户的资料，通过这种压缩策略，整个消息 集里就保存了所有用户最新的资料。
+
+
+### 磁盘存储
+
+**在 Kafka 中，大量使用了 PageCache**， 这也是 Kafka 能实现高吞吐的重要因素之一， 当一个进程准备读取磁盘上的文件内容时，操作系统会先查看待读取的数据页是否在 PageCache 中，如果命中则直接返回数据，从而避免了对磁盘的 I/O 操作；如果没有命中，操作系统则会向磁盘发起读取请求并将读取的数据页存入 PageCache 中，之后再将数据返回给进程。同样，如果一个进程需要将数据写入磁盘，那么操作系统也会检查数据页是否在页缓存中，如果不存在，则 PageCache 中添加相应的数据页，最后将数据写入对应的数据页。被修改过后的数据页也就变成了脏页，操作系统会在合适的时间把脏页中的数据写入磁盘，以保持数据的一致性。
+
+
+
+   **除了消息顺序追加写日志、PageCache以外， kafka 还使用了零拷贝（Zero-Copy）技术来进一步提升系统性能**， 如下图所示：
+
+![image-20230301221724263](assets/image-20230301221724263.png)
+
+
+
+### 磁盘写入的整个流程
+
+![图片](assets/640-16776807412123.png)
+
+
 
 
 
