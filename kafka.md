@@ -839,6 +839,209 @@ Log 中写入消息是顺序写入的。**但是只有最后一个 LogSegement �
 
 
 
+
+
+### Kafka OffsetIndex
+
+Kafka的底层存储是通过OffsetIndex来进行存储的，不过与RocketMQ 不同的是，Kafka的索引数据是以稀疏索引的方式存储的，通过上面可以知道Kafka在存储数据时并不是每写入一条数据就是添加一条索引，而是每写入4K的数据才会在OffsetIndex文件中添加索引
+
+OffsetIndex继承了AbstractIndex，在AbstractIndex中定义了当前索引记录的索引数，以及当前索引文件代表的索引范围，如下：
+
+```java
+//这里的baseOffset指的是文件名称
+private final long baseOffset;
+/**
+ * The maximum number of entries this index can hold
+ */
+//当前index文件可以存储的最大entry数量
+private volatile int maxEntries;
+
+//当前index文件存储的索引数量
+/** The number of entries in this index */
+private volatile int entries;
+```
+
+**Kafka索引文件以及数据文件都是以offset命名的，与RocketMQ不同的是，这里的offset指的是添加数据时offset，而不是物理文件的偏移量**
+
+Kafka在查找数据时使用的是二分查找法来定位数据，因为kafka在添加索引数据时通过特定的策略保证了在索引文件内部的所有索引数据都是有序的，如下：
+
+![image-20230307004822517](assets/image-20230307004822517.png)
+
+
+
+Kafka的索引Entry 由8个字节组成，4个字节用来表示当前消息的offset，4个字节用来存储当前索引在物理文件中的偏移量，在介绍AbstractIndex的查找流程时，先说一下OffsetIndex的parseEntry方法：
+
+```java
+//这里的n指的是对应的slot槽，既一个索引数据为一个槽，一个索引数据为8个字节
+//index fileSize / 8 就表示当前索引文件存储了多少个索引
+protected OffsetPosition parseEntry(ByteBuffer buffer, int n) {
+
+	//baseOffset指的是当前索引文件的名称，既当前索引文件是从哪一个offset开始的
+    return new OffsetPosition(baseOffset() + relativeOffset(buffer, n), physical(buffer, n));
+}
+
+//relativeOffset指的是以文件为单位的相对offset，
+//假设 offset为10， 那么文件的baseOffset = 8，这里的 relativeOffset = 2
+private int relativeOffset(ByteBuffer buffer, int n) {
+        return buffer.getInt(n * ENTRY_SIZE);
+}
+```
+
+****
+
+索引查找主要分为两个方法，一个是用来查找比当前 targetOffset 小的offset，一个是用来查找比当前 targetOffset 大的offset，因为Kafka的索引文件是以稀疏索引的方式存储的，那么在查找过程中可能就会找不到对应的offset值，所以就需要返回比targetOffset值小一个节点或者是大一个节点的值，举个例子如下：
+
+![image-20230307005910602](assets/image-20230307005910602.png)
+
+假设我们需要查找targetOffset = 8 的索引数据时，我们在索引文件中时查询不到的，那么这个就要根据查询需要返回比targetOffset 小一个节点的 offset = 1的值，或者是比targetOffset 大一个节点的 offset = 10 的值，下面的方法就对应了这两个实现：
+
+
+
+```java
+//找到存储小于或等于给定目标键或值的最大项的槽。使用‘ IndexEntry.compareTo ()’方法进行比较。
+protected int largestLowerBoundSlotFor(ByteBuffer idx, long target, IndexSearchType searchEntity) {
+    return indexSlotRangeFor(idx, target, searchEntity, SearchResultType.LARGEST_LOWER_BOUND);
+}
+
+/**
+ * Find the smallest entry greater than or equal the target key or value. If none can be found, -1 is returned.
+ */
+//查找大于或等于目标键或值的最小项。如果找不到，则返回 -1。
+protected int smallestUpperBoundSlotFor(ByteBuffer idx, long target, IndexSearchType searchEntity) {
+    return indexSlotRangeFor(idx, target, searchEntity, SearchResultType.SMALLEST_UPPER_BOUND);
+}
+```
+
+
+
+这里要说一下，kafka 对于查找做了一层优化，因为我们知道kafka的索引文件是通过mmap进行写入的，而mmap之后本身不会将实际的物理内存与虚拟内存进行影射，而是会产生页中断，那么最后一次写入数据的页对比之前写入的数据来说有更高的概率驻留在内存中，所以在查找数据时会优从这个范围查找数据，kafka计算的方式就是通过： 实际存储的entries - `  8192 / entrySize()` 来进行计算最后驻留在内存中的页的数据，如下：
+
+![image-20230307011958642](assets/image-20230307011958642.png)
+
+根据如上规则，kafka的查询操作就分为了两部，首先判断要查找的targetOffset是否在warmEnties的范围内，如果在warmEnties的范围内则会优先对这块范围进行查找**（因为在实际的场景中，当创建消息数据时，往往consumer会很快的去消费这条数据，那么consumer在通过offset查找数据时，会高频的访问这一块内存），那么这一块内存被swap出去的概率就会极低，所以优先对这块内存进行查找会提升性能**，如果targetOffset 比 warmEntires() 中最小的offset 还要小，那么再查找 0 - warmEntrties() 之间的数据
+
+```java
+/**
+ * Lookup lower or upper bounds for the given target.
+ * @param target 实际要查找的 offse
+ */
+ 
+//target：实际要查找的offset索引值
+// searchResultType：表示查找的索引值是大于等于targetOffset，还是小于等于targetOffset的索引 
+private int indexSlotRangeFor(ByteBuffer idx, long target, IndexSearchType searchEntity,
+                              SearchResultType searchResultType) {
+    // check if the index is empty
+    if (entries == 0)
+        return -1;
+
+
+    //entires 表示当前索引已经存储了多少数据了
+    // 对于OffsetIndex说每一条数据占用了8个字节，其中4个字节为offset的值，4个字节表示当前offset在Segment文件中对应的position位置
+    int firstHotEntry = Math.max(0, entries - 1 - warmEntries());
+    // check if the target offset is in the warm section of the index
+    // compareIndexEntry 是比较firstHotEntry 对应的offset 与实际的要查找的offset比较，如果 < 则直接进行二分查找
+    //这里做了一层优化，就是如果要查找的offset在baseOffset 至 warmEntries的范围，则直接查找该范围的数据，这样可以提升性能
+    if (compareIndexEntry(parseEntry(idx, firstHotEntry), target, searchEntity) < 0) {
+        return binarySearch(idx, target, searchEntity,
+            searchResultType, firstHotEntry, entries - 1);
+    }
+
+    //判断查找的target offset值是否小于当前IndexFile中的最小的offset值，如果小于则返回-1，表示要从上一个index文件查找
+    // check if the target offset is smaller than the least offset
+    if (compareIndexEntry(parseEntry(idx, 0), target, searchEntity) > 0) {
+        switch (searchResultType) {
+            case LARGEST_LOWER_BOUND:
+                return -1;
+            case SMALLEST_UPPER_BOUND:
+                return 0;
+        }
+    }
+	
+	//如果上面的条件都不满足，则查找 0 至 firstHotEntry 范围的数据
+	//也就是说上面如果满足条件查找的是 firstHotEntry - 实际存储的entries 之间的数据
+	//这里要说明一点就是，0 或者是firstHotEntry并不是代表的offset数据，而是代表的slot，每一个slot都是一个索引数据
+    return binarySearch(idx, target, searchEntity, searchResultType, 0, firstHotEntry);
+}
+```
+
+
+
+binarySearch 则是比较标准的二分查找法，不过不一样的是二分查找的条件则是通过slot来进行查找的，比如查找的范围是slot0 - slot100，那么在查找时会先找到50这个节点，通过slot50 可以获取到这个slot存储的索引数据，然后取出offset 与 targetOffset进行比较，如果小于targetOffset 则再次查找slot0 - slot50之间的数据，否则查找slot51 - slot100之间的数据
+
+
+
+```java
+/**
+ *
+ * @param idx
+ * @param target 要查找的具体的offset值
+ * @param searchEntity 查找的类型，是根据key 还是value
+ * @param searchResultType 查找的类型，是查找小于target offset的值，还是大于targetOffset的值
+ * @param begin 开始查找的entry位置，这里不再是偏移量而是具体存储的index entry位置
+ * @param end  结束的entry位置
+ * @return
+ */
+private int binarySearch(ByteBuffer idx, long target, IndexSearchType searchEntity,
+                         SearchResultType searchResultType, int begin, int end) {
+    // binary search for the entry
+
+    //获取最小值
+    int lo = begin;
+
+    //获取最大值
+    int hi = end;
+
+    //传统的二分查找写法
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >>> 1;
+
+        //根据mid获取到中间的IndexEntry，注意这里的mid指的不是offset，而是entry slot
+        IndexEntry found = parseEntry(idx, mid);
+
+        //比较查找到的indexEntry 与 实际要查找的offset，
+        // 如果 > 0 表示比实际查找到的要大，否则就是要小
+        int compareResult = compareIndexEntry(found, target, searchEntity);
+        
+        //如果查找的midOffset > targetOffset, 则将hign 设置为mid-1
+        if (compareResult > 0)
+            hi = mid - 1;
+        //否则 midOffset < targetOffset, 则将low设置为mid
+        else if (compareResult < 0)
+            lo = mid;
+        else
+            return mid;
+    }
+
+    //如果没有查找到对应的targetOffset，那么就根据查询的类型返回 LOWER 或者是 Upper
+    //这里需要提一下的是，二分查找就算是没有查询到对应的数据，那么最终结果也会得到一条数据
+    // 比如： 1,2,4,6,8 ，查找 5 ，最终是肯定找不到的，但是最终查询完成后lower = 4，我们可以获取到比最终数据小的那一条数据
+    //这里拿到比实际offset小的那个slot的位置 然后可以遍历 
+    //lower_slot_offset 对应的物理偏移量 ~ lower+1_slot_offset  对应的物理偏移量 之间的数据，最终定位到具体的数据
+    switch (searchResultType) {
+        case LARGEST_LOWER_BOUND:
+            return lo;
+        case SMALLEST_UPPER_BOUND:
+            //如果lower
+            if (lo == entries - 1)
+                return -1;
+            else
+                return lo + 1;
+        default:
+            throw new IllegalStateException("Unexpected searchResultType " + searchResultType);
+    }
+}
+```
+
+****
+
+**lower slot offset 对应的物理偏移量 ~ lower+1 slot offset  对应的物理偏移量 之间的数据，最终定位到具体的数据**
+
+![image-20230307014338862](assets/image-20230307014338862.png)
+
+
+
+
+
 ### 日志清除
 
 Kafka 将消息存储到磁盘中，随着写入数据不断增加，磁盘占用空间越来越大，为了控制占用空间就需要对消息做一定的清理操作。从上面 Kafka 存储日志结构分析中每一个分区副本（Replica）都对应一个 Log，而 Log 又可以分为多个日志分段（LogSegment），这样就便于 Kafka 对日志的清理操作。
